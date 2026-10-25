@@ -1,70 +1,64 @@
-BLUEPRINT / CLASS DIAGRAM
+BLUEPRINT / SERVER MODULES AND DATA MODEL
 
-+---------------------+          +---------------------+
-|       Client        |          |       Server        |
-|---------------------|  TCP/IP  |---------------------|
-| Customer menu       |<-------->| Request handler     |
-| Employee menu       | requests | Role authorization  |
-| Manager menu        |          | Session table       |
-| Administrator menu  |          | pthread workers     |
-+---------------------+          +----------+----------+
-                                            |
-                              +-------------+--------------+
-                              | Synchronization / storage  |
-                              |----------------------------|
-                              | pthread process mutex       |
-                              | fcntl database lock         |
-                              | atomic text-file rewrite    |
-                              +-------------+--------------+
-                                            |
-                    +-----------------------+---------------------+
-                    |                       |                     |
-             +------+-------+        +------+-------+       +-----+------+
-             | User records |        | Accounts     |       | Loan records|
-             | id, role,    |        | owner, cents,|       | customer,   |
-             | username,    |        | active       |       | amount,     |
-             | password     |        +--------------+       | status, emp |
-             +--------------+                               +------------+
-                    |                       |                     |
-                    +-----------------------+---------------------+
-                                            |
-                             +--------------+---------------+
-                             | Transactions / Feedback      |
-                             | owner, type, amount, time,    |
-                             | details / feedback text       |
-                             +------------------------------+
+MODULE STRUCTURE
 
-CLASS / DATA MODEL
+server/
+  app/
+    main.c                         TCP listener and connection workers
+  components/
+    request_handler.c              protocol dispatch and banking operations
+    request_handler.h              request-handler interface
+    session_manager.c              login/session lifecycle
+    session_manager.h               session interface
+  storage/
+    database.c                     table files, record locks, append IDs, WAL
+    database.h                     database and transaction interface
+  utils/
+    common.h                       roles, limits, shared record structures
+    socket_io.c                    socket request/response helper functions
+    socket_io.h                    socket helper interface
+
+data tables (database/)
+  users.txt
+  accounts.txt
+  loans.txt
+  transactions.txt
+  feedback.txt
+
+DATA RECORDS
 
 User
-  id: integer (primary key)
-  role: CUSTOMER | EMPLOYEE | MANAGER | ADMIN
-  username: unique text
-  password: demo-only plain text
+  id: sequential user row ID
+  role: CUSTOMER, EMPLOYEE, MANAGER, or ADMINISTRATOR
+  username: unique text, max 49 characters
+  password: demo-only plain text, max 49 characters
 
 Account
-  user_id: User id (one account per customer)
+  user_id: unique foreign key to users.txt; also the client-visible account number
   balance: integer cents
-  active: boolean
+  active: whether customer operations are enabled
+  row exists only for an actual account; staff without an account have no logical account row
+  blank physical slots preserve direct user-ID byte-range locking without storing placeholder data
 
-LoanApplication
-  id: integer (primary key)
-  customer_id: User id
+Loan
+  id: sequential loan row ID
+  customer_id: customer user ID
   amount: integer cents
-  status: PENDING | ASSIGNED | APPROVED | REJECTED
-  employee_id: assigned employee id, or zero
+  status: PENDING, ASSIGNED, APPROVED, or REJECTED
+  employee_id: assigned employee ID, or zero
 
 Transaction
-  id: integer (primary key)
-  customer_id: User id
-  type: OPENING | DEPOSIT | WITHDRAW | TRANSFER_OUT | TRANSFER_IN | LOAN_CREDIT
+  id: sequential transaction row ID
+  customer_id: owner of the transaction
   amount: integer cents
-  timestamp, details: text
+  type: opening, deposit, withdrawal, transfer, or loan credit
+  timestamp and details: printable text
 
 Feedback
-  id: integer (primary key)
-  customer_id: User id
-  text: text
+  id: sequential feedback row ID
+  customer_id: submitting customer
+  text: up to 255 characters
 
-Session
-  user_id, role, last activity, active flag; held in server memory. Only one live session per user is admitted per server process.
+LOCKING AND TRANSACTION OBJECTS
+
+DbTransaction holds the per-record locks and pending record images for one request. DbEntry identifies the table, record ID, lock mode, and changed value. fcntl locks cover only the fixed byte range for the selected record. Append locks allocate new IDs; the WAL/commit lock protects cross-table commit and recovery. Sessions are held in a process-local table and are not part of the persistent database.

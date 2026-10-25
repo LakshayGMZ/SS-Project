@@ -1,6 +1,7 @@
-server
-client
-bank.txt.lock
-bank.txt.tmp
-banking_system.zip
-QA.txt
+/bank-server
+/client
+/database/.locks/
+/database/*.tmp
+
+/banking_system.zip
+/QA.txt

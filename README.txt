@@ -1,19 +1,17 @@
 BANKING MANAGEMENT SYSTEM (COLLEGE PROJECT)
 
-OVERVIEW
-A small C client/server banking simulation. The client sends one pipe-delimited request over TCP for each menu action. The server uses POSIX sockets, pthreads, a process mutex, and fcntl advisory file locks. Records are stored in a human-readable text database.
-
 BUILD
     make
 
-START THE SERVER
-    ./server
-    ./server 8080 bank.txt
+This builds bank-server and client with the system C compiler, pthreads, and POSIX APIs. No external package is required.
 
-Start the client in another terminal:
+RUN
+    ./bank-server
     ./client
 
-The supplied client defaults to 127.0.0.1:8080. Edit SERVER_IP and PORT near the top of client.c to connect to another server.
+The server defaults to port 8080 and database directory ./database. Optional arguments are:
+    ./bank-server [port] [database-directory]
+The supplied client connects to 127.0.0.1:8080. Change SERVER_IP and PORT in client.c to use another endpoint.
 
 DEMO ACCOUNTS
     Administrator: admin / admin123
@@ -21,23 +19,37 @@ DEMO ACCOUNTS
     Employee:      employee / employee123
     Customer:      customer / customer123
 
-The ZIP includes bank.txt with the demo accounts and a customer account balance of 1000.00. If bank.txt is absent, the server creates it with the same demo data. The database and its .lock file are created in the server's current directory unless another database path is supplied.
+SERVER STRUCTURE
+    server/app/main.c                         socket listener and client workers
+    server/components/request_handler.c       protocol, authorization, banking operations
+    server/components/session_manager.c       in-memory login sessions
+    server/storage/database.c                text tables, record locks, append allocation, WAL
+    server/utils/socket_io.c                 request receive and response send helpers
+    server/utils/common.h                    shared role and data-record definitions
+    server/*/*.h                             module interfaces
+
+TEXT DATABASE
+The database directory contains one fixed-width, pipe-delimited text file per table:
+    users.txt
+    accounts.txt
+    loans.txt
+    transactions.txt
+    feedback.txt
+
+The server creates and seeds these files on first start if all tables are empty. The existing records were migrated into these tables. The accounts table stores only actual accounts: user_id is a unique reference to a user and remains the account number accepted by the client. Staff who have never been customers have no account record; a customer changed to another role keeps their existing account inactive. For direct record locking, the file reserves blank fixed-width slots at user IDs with no account. Blank slots contain no account data or marker and are not logical account records. Startup validation checks unique usernames, unique account owners, customer-account relationships, and user references in loans, transactions, and feedback. Every stored row uses full table and role names, and full account states and transaction kinds; there are no one-letter table tags or numeric role/boolean codes.
+
+LOCKING AND COMMIT
+Each table row has a stable byte range because records have fixed widths. Database reads acquire a shared fcntl lock and updates acquire an exclusive fcntl lock only on the row being accessed. The range begins at (record_id - 1) * record_size. A small set of hashed pthread mutexes prevents same-process threads from relying on process-associated fcntl behavior. Separate append locks under database/.locks allocate IDs safely; they are not used to lock ordinary record access.
+
+A request that changes several records keeps those record locks until commit. The database writes a write-ahead journal under database/.locks, fsyncs it, updates the affected table rows with pwrite, fsyncs those files, and then clears the journal. Startup and later requests replay a complete journal if a process stopped during a multi-table commit. This supports atomic transfers, loan credits, and account creation without rewriting whole tables. Journal, startup, append, and commit lock files are control files, not additional tables.
 
 FEATURES
-- Customer registration/login, balance, deposit, withdrawal, transfer, loan application, password change, transaction history, feedback, logout.
-- Employees can create customer accounts, reset customer passwords, view passbooks, view assigned loans, and approve/reject assigned applications.
-- Managers can activate/deactivate customer accounts, assign pending loans, and review feedback.
-- Administrators can add employees, reset user passwords, and change user roles.
-- One active session per user in a running server. Idle sessions expire after 30 minutes; restarting the server clears sessions.
-- Currency is stored as integer cents. Amounts accept at most two decimal places.
+- Customers can register/login, check balances, deposit, withdraw, transfer, apply for loans, change passwords, add feedback, view history, and log out.
+- Employees can create customers, reset customer passwords, view passbooks, and process assigned loans.
+- Managers can activate/deactivate accounts, assign pending loans, and review feedback.
+- Administrators can add employees, reset passwords, and manage roles.
+- Deposits, withdrawals, transfers, and loan credits store integer cents and write transaction history.
+- One active session per user per server process; idle sessions expire after 30 minutes.
 
-DATA AND SYNCHRONIZATION
-The text database uses record types U (user), A (account), L (loan), T (transaction), and F (feedback). The server serializes its worker threads with a pthread mutex because POSIX fcntl locks are process-associated on common systems. It also holds an exclusive fcntl lock on bank.txt.lock while loading and updating the database, so separate server processes sharing this database cannot interleave updates. A change is written to bank.txt.tmp, fsynced, then renamed over the database while the lock is held. Transfers and approved loans update balances, statuses, and transaction records in one database snapshot.
-
-PROTOCOL
-Each TCP connection carries one request in this format:
-    COMMAND|ROLE_ID|USER_ID|ARGUMENTS...
-Responses are SUCCESS|message or ERROR|message. LOGIN is LOGIN|role|username|password. CREATE_CUSTOMER is CREATE_CUSTOMER|1|username|password. See command names in client.c and dispatch logic in server.c. The server also supports the existing client's response expectation for successful registration/login: SUCCESS|user_id|message and SUCCESS|user_id|message respectively.
-
-CLASSROOM PROJECT LIMITATIONS
-This is an educational simulation, not production banking software. Passwords are stored in plain text, the protocol is unencrypted, and the client-supplied role/user IDs are not protected by a cryptographic session token. Do not use real personal data, passwords, or money. A real system would require password hashing, TLS, stronger session authentication, audit controls, and extensive security review.
+LIMITATIONS
+This is an educational simulation, not production banking software. Passwords are stored in plain text, the protocol is unencrypted, sessions are process-local, and the simple protocol does not use cryptographic session tokens. Table records have fixed capacities defined in server/storage/database.c. Do not use real credentials or financial data.
