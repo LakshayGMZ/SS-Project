@@ -1,4 +1,0 @@
-USER|0000000001|ADMINISTRATOR|admin                                            |admin123                                         
-USER|0000000002|MANAGER      |manager                                          |manager123                                       
-USER|0000000003|EMPLOYEE     |employee                                         |employee123                                      
-USER|0000000004|CUSTOMER     |customer                                         |customer123                                      

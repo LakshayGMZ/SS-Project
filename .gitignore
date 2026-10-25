@@ -1,7 +1,6 @@
 /bank-server
 /client
-/database/.locks/
-/database/*.tmp
+database
 
 /banking_system.zip
 /QA.txt

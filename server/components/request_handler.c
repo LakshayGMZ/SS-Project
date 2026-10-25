@@ -135,9 +135,10 @@ static int append_transaction(DbTransaction *transaction, int customer_id, const
     return id;
 }
 
-static int ensure_authorized(Database *database, int role, int user_id, char *out) {
+static int ensure_authorized(Database *database, int role, int user_id,
+                             uintptr_t connection_id, char *out) {
     User user;
-    if (!sessions_authorize(user_id, role)) {
+    if (!sessions_authorize(user_id, role, connection_id)) {
         reply(out, "ERROR", "Please log in again.");
         return 0;
     }
@@ -151,7 +152,7 @@ static int ensure_authorized(Database *database, int role, int user_id, char *ou
 
 static int add_new_customer(Database *database, const char *username, const char *password,
                             long long initial_balance, bool register_and_login,
-                            char *out) {
+                            uintptr_t connection_id, char *out) {
     DbTransaction *transaction = db_tx_begin(database);
     DbRecord *stored_user = NULL;
     DbRecord user_record = {0};
@@ -188,7 +189,7 @@ static int add_new_customer(Database *database, const char *username, const char
         }
     }
     if (register_and_login) {
-        session_started = sessions_start(user_id, CUSTOMER);
+        session_started = sessions_start(user_id, CUSTOMER, connection_id);
         if (!session_started) {
             db_tx_abort(transaction); reply(out, "ERROR", "Could not create session."); return 0;
         }
@@ -405,7 +406,7 @@ static int process_customer(Database *database, const RequestFields *fields,
 }
 
 static int process_employee(Database *database, const RequestFields *fields,
-                            int role, int user_id, char *out) {
+                            int role, int user_id, uintptr_t connection_id, char *out) {
     const char *command = fields->values[0];
     if (strcmp(command, "ADD_CUSTOMER") == 0 && role == EMPLOYEE) {
         long long balance;
@@ -415,7 +416,8 @@ static int process_employee(Database *database, const RequestFields *fields,
             !parse_balance(fields->values[5], &balance)) {
             reply(out, "ERROR", "Invalid customer details or opening balance."); return 1;
         }
-        return add_new_customer(database, fields->values[3], fields->values[4], balance, false, out);
+        return add_new_customer(database, fields->values[3], fields->values[4], balance, false,
+                                connection_id, out);
     }
 
     if (strcmp(command, "MOD_CUSTOMER") == 0 && role == EMPLOYEE) {
@@ -739,7 +741,8 @@ static int process_admin(Database *database, const RequestFields *fields,
     return 0;
 }
 
-void handle_request(Database *database, char *request, char *response) {
+void handle_request(Database *database, char *request, char *response,
+                    uintptr_t connection_id) {
     RequestFields fields = {0};
     int role, user_id;
     split_request(request, &fields);
@@ -754,7 +757,8 @@ void handle_request(Database *database, char *request, char *response) {
             strlen(fields.values[2]) >= USERNAME_SIZE || strlen(fields.values[3]) >= PASSWORD_SIZE) {
             reply(response, "ERROR", "Invalid registration details."); return;
         }
-        add_new_customer(database, fields.values[2], fields.values[3], zero_balance, true, response);
+        add_new_customer(database, fields.values[2], fields.values[3], zero_balance, true,
+                         connection_id, response);
         return;
     }
 
@@ -774,7 +778,7 @@ void handle_request(Database *database, char *request, char *response) {
                 reply(response, "ERROR", "Customer account is inactive."); return;
             }
         }
-        if (!sessions_start(user.id, role)) {
+        if (!sessions_start(user.id, role, connection_id)) {
             reply(response, "ERROR", "This user already has an active session."); return;
         }
         snprintf(response, RESPONSE_SIZE, "SUCCESS|%d|Login successful.", user.id);
@@ -785,10 +789,10 @@ void handle_request(Database *database, char *request, char *response) {
         !parse_id(fields.values[2], &user_id) || role < CUSTOMER || role > ADMIN) {
         reply(response, "ERROR", "Invalid request fields."); return;
     }
-    if (!ensure_authorized(database, role, user_id, response)) return;
+    if (!ensure_authorized(database, role, user_id, connection_id, response)) return;
 
     if (strcmp(command, "LOGOUT") == 0) {
-        sessions_logout(user_id);
+        sessions_logout_connection(connection_id);
         reply(response, "SUCCESS", "Logged out.");
         return;
     }
@@ -809,7 +813,7 @@ void handle_request(Database *database, char *request, char *response) {
     }
 
     if (process_customer(database, &fields, role, user_id, response)) return;
-    if (process_employee(database, &fields, role, user_id, response)) return;
+    if (process_employee(database, &fields, role, user_id, connection_id, response)) return;
     if (process_manager(database, &fields, role, response)) return;
     if (process_admin(database, &fields, role, response)) return;
     reply(response, "ERROR", "Unknown command or insufficient role permissions.");

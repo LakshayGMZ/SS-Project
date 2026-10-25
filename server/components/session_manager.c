@@ -24,7 +24,7 @@ void sessions_init(void) {
     pthread_mutex_unlock(&session_mutex);
 }
 
-bool sessions_start(int user_id, int role) {
+bool sessions_start(int user_id, int role, uintptr_t connection_id) {
     time_t now = time(NULL);
     pthread_mutex_lock(&session_mutex);
     expire_sessions(now);
@@ -36,7 +36,7 @@ bool sessions_start(int user_id, int role) {
     }
     for (size_t i = 0; i < MAX_SESSIONS; i++) {
         if (!sessions[i].active) {
-            sessions[i] = (UserSession){ user_id, role, now, true };
+            sessions[i] = (UserSession){ user_id, role, now, connection_id, true };
             pthread_mutex_unlock(&session_mutex);
             return true;
         }
@@ -45,13 +45,14 @@ bool sessions_start(int user_id, int role) {
     return false;
 }
 
-bool sessions_authorize(int user_id, int role) {
+bool sessions_authorize(int user_id, int role, uintptr_t connection_id) {
     time_t now = time(NULL);
     bool authorized = false;
     pthread_mutex_lock(&session_mutex);
     expire_sessions(now);
     for (size_t i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].active && sessions[i].user_id == user_id && sessions[i].role == role) {
+        if (sessions[i].active && sessions[i].user_id == user_id && sessions[i].role == role &&
+                    sessions[i].connection_id == connection_id) {
             sessions[i].last_seen = now;
             authorized = true;
             break;
@@ -65,6 +66,14 @@ void sessions_logout(int user_id) {
     pthread_mutex_lock(&session_mutex);
     for (size_t i = 0; i < MAX_SESSIONS; i++)
         if (sessions[i].active && sessions[i].user_id == user_id)
+            sessions[i].active = false;
+    pthread_mutex_unlock(&session_mutex);
+}
+
+void sessions_logout_connection(uintptr_t connection_id) {
+    pthread_mutex_lock(&session_mutex);
+    for (size_t i = 0; i < MAX_SESSIONS; i++)
+        if (sessions[i].active && sessions[i].connection_id == connection_id)
             sessions[i].active = false;
     pthread_mutex_unlock(&session_mutex);
 }

@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,59 +16,98 @@
 int current_user_id = -1;
 int current_role_id = -1; // 1=Customer, 2=Employee, 3=Manager, 4=Admin
 
-void send_request(const char *request_message, char *response) {
-    int sock_fd;
-    struct sockaddr_in server_addr;
-    size_t sent_total = 0;
-    size_t response_size = 0;
+static int client_socket = -1;
 
-    response[0] = '\0';
-    sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        snprintf(response, BUFFER_SIZE, "ERROR|Could not create socket.");
-        return;
+static void close_client_connection(void) {
+    if (client_socket >= 0) {
+        close(client_socket);
+        client_socket = -1;
     }
+}
+
+static int connect_client(void) {
+    struct sockaddr_in server_addr;
+    if (client_socket >= 0) return 0;
+    client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_socket < 0) return -1;
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
-        snprintf(response, BUFFER_SIZE, "ERROR|Server address is invalid.");
-        close(sock_fd);
-        return;
+    if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0 ||
+        connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        close_client_connection();
+        return -1;
     }
-    if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        snprintf(response, BUFFER_SIZE, "ERROR|Connection refused. Is server running?");
-        close(sock_fd);
-        return;
-    }
+    return 0;
+}
 
-    while (sent_total < strlen(request_message)) {
-        ssize_t sent = send(sock_fd, request_message + sent_total,
-                            strlen(request_message) - sent_total, 0);
-        if (sent <= 0) {
-            snprintf(response, BUFFER_SIZE, "ERROR|Could not send request.");
-            close(sock_fd);
-            return;
-        }
+static int send_bytes(const char *data, size_t length) {
+    size_t sent_total = 0;
+    while (sent_total < length) {
+        ssize_t sent = send(client_socket, data + sent_total, length - sent_total, 0);
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent <= 0) return -1;
         sent_total += (size_t)sent;
     }
+    return 0;
+}
 
-    while (response_size < BUFFER_SIZE - 1) {
-        ssize_t received = recv(sock_fd, response + response_size,
-                                BUFFER_SIZE - 1 - response_size, 0);
-        if (received < 0) {
-            snprintf(response, BUFFER_SIZE, "ERROR|Could not receive server response.");
-            close(sock_fd);
-            return;
-        }
-        if (received == 0) break;
-        response_size += (size_t)received;
+static int receive_bytes(char *data, size_t length) {
+    size_t received_total = 0;
+    while (received_total < length) {
+        ssize_t received = recv(client_socket, data + received_total,
+                                length - received_total, 0);
+        if (received < 0 && errno == EINTR) continue;
+        if (received <= 0) return -1;
+        received_total += (size_t)received;
     }
+    return 0;
+}
+
+static int receive_response(char *response) {
+    char header[32];
+    size_t header_size = 0;
+    size_t response_size = 0;
+    while (header_size < sizeof(header) - 1) {
+        char byte;
+        if (receive_bytes(&byte, 1) != 0) return -1;
+        if (byte == '\n') break;
+        if (byte < '0' || byte > '9') return -1;
+        header[header_size++] = byte;
+    }
+    if (header_size == 0 || header_size >= sizeof(header) - 1) return -1;
+    header[header_size] = '\0';
+    for (size_t i = 0; i < header_size; i++) {
+        size_t digit = (size_t)(header[i] - '0');
+        if (response_size > (BUFFER_SIZE - 1 - digit) / 10) return -1;
+        response_size = response_size * 10 + digit;
+    }
+    if (response_size >= BUFFER_SIZE ||
+        receive_bytes(response, response_size) != 0) return -1;
     response[response_size] = '\0';
-    if (response_size == 0)
-        snprintf(response, BUFFER_SIZE, "ERROR|Server closed connection.");
-    close(sock_fd);
+    return 0;
+}
+
+void send_request(const char *request_message, char *response) {
+    response[0] = '\0';
+    if (connect_client() != 0) {
+        if (current_user_id != -1) {
+            current_user_id = -1;
+            current_role_id = -1;
+        }
+        snprintf(response, BUFFER_SIZE, "ERROR|Could not connect to server.");
+        return;
+    }
+    if (send_bytes(request_message, strlen(request_message)) != 0 ||
+        send_bytes("\n", 1) != 0 || receive_response(response) != 0) {
+        close_client_connection();
+        if (current_user_id != -1) {
+            current_user_id = -1;
+            current_role_id = -1;
+        }
+        snprintf(response, BUFFER_SIZE, "ERROR|Connection to server was lost.");
+    }
 }
 
 void clear_input_buffer() {
@@ -145,7 +185,7 @@ void customer_menu() {
         send_request(request, response);
         token = strtok(response, "|");
         if (token && strcmp(token, "SUCCESS") == 0) {
-            printf(">> SUCCESS: ");
+            printf(">> SUCCESS:\n");
             token = strtok(NULL, "");
             if (token) printf("%s\n", token);
         } else {
@@ -241,7 +281,7 @@ void employee_menu() {
         send_request(request, response);
         token = strtok(response, "|");
         if (token && strcmp(token, "SUCCESS") == 0) {
-            printf(">> SUCCESS: ");
+            printf(">> SUCCESS:\n");
             token = strtok(NULL, "");
             if (token) {
                 if (choice == 4) {
@@ -349,7 +389,7 @@ void manager_menu() {
         send_request(request, response);
         token = strtok(response, "|");
         if (token && strcmp(token, "SUCCESS") == 0) {
-            printf(">> SUCCESS: ");
+            printf(">> SUCCESS:\n");
             token = strtok(NULL, "");
             if (token) {
                 if (choice == 3) {
@@ -437,7 +477,7 @@ void administrator_menu() {
 	send_request(request, response);
         token = strtok(response, "|");
         if (token && strcmp(token, "SUCCESS") == 0) {
-            printf(">> SUCCESS: ");
+            printf(">> SUCCESS:\n");
             token = strtok(NULL, "");
             if (token) printf("%s\n", token);
         } else {
@@ -453,6 +493,7 @@ int main() {
     int role_choice;
     setvbuf(stdout, NULL, _IONBF, 0);
     signal(SIGPIPE, SIG_IGN);
+    atexit(close_client_connection);
     char username[50], password[50];
     char request[BUFFER_SIZE];
     char response[BUFFER_SIZE];

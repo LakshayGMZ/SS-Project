@@ -25,11 +25,14 @@ static void *client_worker(void *argument) {
     ClientConnection *connection = argument;
     char request[REQUEST_SIZE];
     char response[RESPONSE_SIZE];
-    ssize_t received = socket_receive_request(connection->socket_fd, request, sizeof(request));
-    if (received > 0) {
-        handle_request(connection->database, request, response);
-        socket_send_all(connection->socket_fd, response);
+    uintptr_t connection_id = (uintptr_t)connection;
+    ssize_t received;
+    while ((received = socket_receive_request(connection->socket_fd, request,
+                                               sizeof(request))) > 0) {
+        handle_request(connection->database, request, response, connection_id);
+        if (socket_send_frame(connection->socket_fd, response) != 0) break;
     }
+    sessions_logout_connection(connection_id);
     close(connection->socket_fd);
     free(connection);
     return NULL;

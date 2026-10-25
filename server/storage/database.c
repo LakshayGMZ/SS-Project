@@ -245,7 +245,7 @@ static int decode_record(DbTable table, int id, const char *raw, DbRecord *recor
         if (record->account.user_id < 1 ||
             (strcmp(activity, "ACTIVE") != 0 && strcmp(activity, "INACTIVE") != 0)) return -1;
         record->account.active = strcmp(activity, "ACTIVE") == 0;
-        return record->account.user_id == id ? 0 : -1;
+        return 0;
     }
     if (table == DB_LOANS) {
         if (split_row(row, fields, 6) != 0 || strcmp(fields[0], "LOAN") != 0) return -1;
@@ -400,14 +400,71 @@ static int ensure_wal_recovered(Database *database) {
     return result;
 }
 
-static int repair_account_slots(Database *database) {
+static int compact_account_rows(Database *database) {
     struct stat status;
-    if (fstat(database->table_fd[DB_ACCOUNTS], &status) != 0 || status.st_size < 0) return -1;
-    off_t remainder = status.st_size % ACCOUNT_ROW_SIZE;
-    if (remainder == 0) return 0;
-    off_t repaired_size = status.st_size - remainder;
-    if (ftruncate(database->table_fd[DB_ACCOUNTS], repaired_size) != 0) return -1;
-    return fsync(database->table_fd[DB_ACCOUNTS]);
+    char table_path[PATH_MAX];
+    char temporary_path[PATH_MAX];
+    if (fstat(database->table_fd[DB_ACCOUNTS], &status) != 0 || status.st_size < 0)
+        return -1;
+    if (snprintf(table_path, sizeof(table_path), "%s/accounts.txt", database->directory) >=
+        (int)sizeof(table_path) ||
+        snprintf(temporary_path, sizeof(temporary_path), "%s/accounts.txt.migrate.XXXXXX",
+                 database->directory) >= (int)sizeof(temporary_path)) return -1;
+
+    off_t complete_size = status.st_size - status.st_size % ACCOUNT_ROW_SIZE;
+    size_t row_count = (size_t)complete_size / ACCOUNT_ROW_SIZE;
+    size_t packed_count = 0;
+    bool needs_compaction = complete_size != status.st_size;
+    char row[ACCOUNT_ROW_SIZE];
+    for (size_t source = 1; source <= row_count; source++) {
+        off_t source_offset = (off_t)(source - 1) * ACCOUNT_ROW_SIZE;
+        if (read_all_at(database->table_fd[DB_ACCOUNTS], row, sizeof(row), source_offset) != 0)
+            return -1;
+        if (blank_account_row(row)) {
+            needs_compaction = true;
+            continue;
+        }
+        DbRecord record;
+        if (decode_record(DB_ACCOUNTS, (int)source, row, &record) != 0) return -1;
+        if (packed_count != source - 1) needs_compaction = true;
+        packed_count++;
+    }
+    if (!needs_compaction) return 0;
+
+    int temporary_fd = mkstemp(temporary_path);
+    if (temporary_fd < 0) return -1;
+    packed_count = 0;
+    for (size_t source = 1; source <= row_count; source++) {
+        off_t source_offset = (off_t)(source - 1) * ACCOUNT_ROW_SIZE;
+        if (read_all_at(database->table_fd[DB_ACCOUNTS], row, sizeof(row), source_offset) != 0) {
+            close(temporary_fd);
+            unlink(temporary_path);
+            return -1;
+        }
+        if (blank_account_row(row)) continue;
+        off_t target_offset = (off_t)packed_count * ACCOUNT_ROW_SIZE;
+        if (write_all_at(temporary_fd, row, sizeof(row), target_offset) != 0) {
+            close(temporary_fd);
+            unlink(temporary_path);
+            return -1;
+        }
+        packed_count++;
+    }
+    int sync_result = fsync(temporary_fd);
+    int close_result = close(temporary_fd);
+    if (sync_result != 0 || close_result != 0 || rename(temporary_path, table_path) != 0) {
+        unlink(temporary_path);
+        return -1;
+    }
+
+    int replacement_fd = open(table_path, O_RDWR);
+    if (replacement_fd < 0 || fchmod(replacement_fd, 0600) != 0) {
+        if (replacement_fd >= 0) close(replacement_fd);
+        return -1;
+    }
+    close(database->table_fd[DB_ACCOUNTS]);
+    database->table_fd[DB_ACCOUNTS] = replacement_fd;
+    return 0;
 }
 
 static int make_directory(const char *path) {
@@ -448,16 +505,8 @@ static int seed_database(Database *database) {
     record.user = (User){ .id = 4, .role = CUSTOMER, .username = "customer", .password = "customer123" };
     if (seed_table_record(database, DB_USERS, 4, &record) != 0) return -1;
 
-    char blank_account[ACCOUNT_ROW_SIZE];
-    memset(blank_account, ' ', sizeof(blank_account));
-    blank_account[sizeof(blank_account) - 1] = '\n';
-    for (int id = 1; id < 4; id++) {
-        off_t offset = (off_t)(id - 1) * ACCOUNT_ROW_SIZE;
-        if (write_all_at(database->table_fd[DB_ACCOUNTS], blank_account,
-                         sizeof(blank_account), offset) != 0) return -1;
-    }
     record.account = (Account){ .user_id = 4, .balance = 100000, .active = true };
-    if (seed_table_record(database, DB_ACCOUNTS, 4, &record) != 0) return -1;
+    if (seed_table_record(database, DB_ACCOUNTS, 1, &record) != 0) return -1;
 
     record.transaction = (Transaction){ .id = 1, .customer_id = 4, .amount = 100000,
                                         .type = "OPENING BALANCE", .timestamp = "2026-10-24 00:00:00",
@@ -525,7 +574,7 @@ Database *db_open(const char *directory, char *error, size_t error_size) {
         goto open_failed;
     }
     int recovery_result = replay_wal(database);
-    if (recovery_result == 0 && repair_account_slots(database) != 0) recovery_result = -1;
+    if (recovery_result == 0 && compact_account_rows(database) != 0) recovery_result = -1;
     size_t counts[DB_TABLE_COUNT] = {0};
     int count_result = 0;
     for (int i = 0; i < DB_TABLE_COUNT; i++)
@@ -637,10 +686,7 @@ int db_tx_get(DbTransaction *transaction, DbTable table, int id, bool write,
         release_record_lock(transaction->database, table, id, shard);
         return -1;
     }
-    if (table == DB_ACCOUNTS && blank_account_row(row)) {
-        release_record_lock(transaction->database, table, id, shard);
-        return 0;
-    }
+
     if (decode_record(table, id, row, &entry->record) != 0) {
         release_record_lock(transaction->database, table, id, shard);
         return -1;
@@ -671,7 +717,7 @@ int db_tx_reserve_append(DbTransaction *transaction, DbTable table) {
     }
     size_t count;
     if (table_record_count(transaction->database, table, &count) != 0 ||
-        (count >= table_limits[table] && table != DB_ACCOUNTS)) {
+        count >= table_limits[table]) {
         lock_region(transaction->database->append_fd[table], F_UNLCK, 0, 0);
         pthread_mutex_unlock(&append_mutexes[table]);
         return -1;
@@ -696,8 +742,7 @@ static void set_record_id(DbTable table, int id, DbRecord *record) {
 
 int db_tx_append(DbTransaction *transaction, DbTable table, const DbRecord *record,
                  int *id, DbRecord **stored_record) {
-    if (!transaction || !record || !id || !stored_record || table < 0 || table >= DB_TABLE_COUNT ||
-        table == DB_ACCOUNTS)
+    if (!transaction || !record || !id || !stored_record || table < 0 || table >= DB_TABLE_COUNT)
         return -1;
     if (!transaction->append[table].held && db_tx_reserve_append(transaction, table) != 0)
         return -1;
@@ -725,63 +770,14 @@ int db_tx_append(DbTransaction *transaction, DbTable table, const DbRecord *reco
     return 0;
 }
 
-static int extend_account_slots(Database *database, int last_slot) {
-    size_t current_slots;
-    if (table_record_count(database, DB_ACCOUNTS, &current_slots) != 0) return -1;
-    if ((size_t)last_slot <= current_slots) return 0;
-
-    char blank[ACCOUNT_ROW_SIZE];
-    memset(blank, ' ', sizeof(blank));
-    blank[sizeof(blank) - 1] = '\n';
-    off_t original_size = (off_t)current_slots * ACCOUNT_ROW_SIZE;
-    for (size_t slot = current_slots + 1; slot <= (size_t)last_slot; slot++) {
-        off_t offset = (off_t)(slot - 1) * ACCOUNT_ROW_SIZE;
-        if (write_all_at(database->table_fd[DB_ACCOUNTS], blank, sizeof(blank), offset) != 0) {
-            ftruncate(database->table_fd[DB_ACCOUNTS], original_size);
-            return -1;
-        }
-    }
-    if (fsync(database->table_fd[DB_ACCOUNTS]) != 0) {
-        ftruncate(database->table_fd[DB_ACCOUNTS], original_size);
-        fsync(database->table_fd[DB_ACCOUNTS]);
-        return -1;
-    }
-    return 0;
-}
-
 int db_tx_create_account(DbTransaction *transaction, int user_id, const Account *account) {
-    if (!transaction || !account || user_id < 1 ||
-        (size_t)user_id > table_limits[DB_ACCOUNTS] || account->user_id != user_id ||
-        !transaction_key_after(transaction, DB_ACCOUNTS, user_id)) return -1;
-    if (db_tx_reserve_append(transaction, DB_ACCOUNTS) != 0 ||
-        extend_account_slots(transaction->database, user_id) != 0 ||
-        transaction->entry_count >= DB_MAX_TX_RECORDS) return -1;
-    for (size_t i = 0; i < transaction->entry_count; i++)
-        if (transaction->entries[i].table == DB_ACCOUNTS &&
-            transaction->entries[i].id == user_id) return -1;
-
-    int shard;
-    if (acquire_record_lock(transaction->database, DB_ACCOUNTS, user_id, true, &shard) != 0)
+    if (!transaction || !account || user_id < 1 || account->user_id != user_id)
         return -1;
-    char row[ACCOUNT_ROW_SIZE];
-    off_t offset = (off_t)(user_id - 1) * ACCOUNT_ROW_SIZE;
-    if (read_all_at(transaction->database->table_fd[DB_ACCOUNTS], row, sizeof(row), offset) != 0 ||
-        !blank_account_row(row)) {
-        release_record_lock(transaction->database, DB_ACCOUNTS, user_id, shard);
-        return -1;
-    }
-    DbEntry *entry = &transaction->entries[transaction->entry_count++];
-    memset(entry, 0, sizeof(*entry));
-    entry->table = DB_ACCOUNTS;
-    entry->id = user_id;
-    entry->shard = shard;
-    entry->write_lock = true;
-    entry->dirty = true;
-    entry->record.account = *account;
-    transaction->has_last_key = true;
-    transaction->last_table = DB_ACCOUNTS;
-    transaction->last_id = user_id;
-    return 0;
+    DbRecord record = {0};
+    DbRecord *stored_record = NULL;
+    int record_id;
+    record.account = *account;
+    return db_tx_append(transaction, DB_ACCOUNTS, &record, &record_id, &stored_record);
 }
 
 static void release_transaction_locks(DbTransaction *transaction) {
@@ -893,13 +889,24 @@ int db_find_user(Database *database, const char *username, User *user) {
 }
 
 int db_find_account(Database *database, int user_id, int *record_id, Account *account) {
-    if (!record_id || !account || user_id < 1) return -1;
-    DbRecord record;
-    int result = db_read_record(database, DB_ACCOUNTS, user_id, &record);
-    if (result != 1) return result;
-    if (record.account.user_id != user_id) return -1;
-    *record_id = user_id;
-    *account = record.account;
+    if (!database || !record_id || !account || user_id < 1) return -1;
+    size_t count;
+    if (db_table_count(database, DB_ACCOUNTS, &count) != 0) return -1;
+    bool found = false;
+    Account match;
+    int match_id = 0;
+    for (size_t id = 1; id <= count; id++) {
+        DbRecord record;
+        if (db_read_record(database, DB_ACCOUNTS, (int)id, &record) != 1) return -1;
+        if (record.account.user_id != user_id) continue;
+        if (found) return -1;
+        found = true;
+        match = record.account;
+        match_id = (int)id;
+    }
+    if (!found) return 0;
+    *record_id = match_id;
+    *account = match;
     return 1;
 }
 
@@ -932,11 +939,9 @@ static int validate_database_relations(Database *database) {
 
     for (size_t id = 1; id <= account_count; id++) {
         DbRecord record;
-        int account_result = db_read_record(database, DB_ACCOUNTS, (int)id, &record);
-        if (account_result == 0) continue;
-        if (account_result != 1) goto done;
+        if (db_read_record(database, DB_ACCOUNTS, (int)id, &record) != 1) goto done;
         int owner = record.account.user_id;
-        if (owner != (int)id || owner < 1 || (size_t)owner > user_count || has_account[owner] ||
+        if (owner < 1 || (size_t)owner > user_count || has_account[owner] ||
             record.account.balance < 0 || (record.account.active && roles[owner] != CUSTOMER)) goto done;
         has_account[owner] = true;
     }
