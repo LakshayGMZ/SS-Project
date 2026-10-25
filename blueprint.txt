@@ -1,0 +1,70 @@
+BLUEPRINT / CLASS DIAGRAM
+
++---------------------+          +---------------------+
+|       Client        |          |       Server        |
+|---------------------|  TCP/IP  |---------------------|
+| Customer menu       |<-------->| Request handler     |
+| Employee menu       | requests | Role authorization  |
+| Manager menu        |          | Session table       |
+| Administrator menu  |          | pthread workers     |
++---------------------+          +----------+----------+
+                                            |
+                              +-------------+--------------+
+                              | Synchronization / storage  |
+                              |----------------------------|
+                              | pthread process mutex       |
+                              | fcntl database lock         |
+                              | atomic text-file rewrite    |
+                              +-------------+--------------+
+                                            |
+                    +-----------------------+---------------------+
+                    |                       |                     |
+             +------+-------+        +------+-------+       +-----+------+
+             | User records |        | Accounts     |       | Loan records|
+             | id, role,    |        | owner, cents,|       | customer,   |
+             | username,    |        | active       |       | amount,     |
+             | password     |        +--------------+       | status, emp |
+             +--------------+                               +------------+
+                    |                       |                     |
+                    +-----------------------+---------------------+
+                                            |
+                             +--------------+---------------+
+                             | Transactions / Feedback      |
+                             | owner, type, amount, time,    |
+                             | details / feedback text       |
+                             +------------------------------+
+
+CLASS / DATA MODEL
+
+User
+  id: integer (primary key)
+  role: CUSTOMER | EMPLOYEE | MANAGER | ADMIN
+  username: unique text
+  password: demo-only plain text
+
+Account
+  user_id: User id (one account per customer)
+  balance: integer cents
+  active: boolean
+
+LoanApplication
+  id: integer (primary key)
+  customer_id: User id
+  amount: integer cents
+  status: PENDING | ASSIGNED | APPROVED | REJECTED
+  employee_id: assigned employee id, or zero
+
+Transaction
+  id: integer (primary key)
+  customer_id: User id
+  type: OPENING | DEPOSIT | WITHDRAW | TRANSFER_OUT | TRANSFER_IN | LOAN_CREDIT
+  amount: integer cents
+  timestamp, details: text
+
+Feedback
+  id: integer (primary key)
+  customer_id: User id
+  text: text
+
+Session
+  user_id, role, last activity, active flag; held in server memory. Only one live session per user is admitted per server process.

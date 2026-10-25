@@ -1,0 +1,34 @@
+ARCHITECTURAL DIAGRAM
+
+  +----------------+       TCP request/response       +-------------------------+
+  | client process | <------------------------------> | server listener :8080   |
+  | role menus     |                                  +------------+------------+
+  +----------------+                                               |
+                                                         accept() per connection
+                                                                    |
+                                                  +-----------------+-----------------+
+                                                  | detached pthread worker per client|
+                                                  +-----------------+-----------------+
+                                                                    |
+                                                  +-----------------v-----------------+
+                                                  | pthread mutex (same-process sync) |
+                                                  +-----------------+-----------------+
+                                                                    |
+                                                  +-----------------v-----------------+
+                                                  | fcntl write lock on bank.txt.lock  |
+                                                  +-----------------+-----------------+
+                                                                    |
+                                          +-------------------------v-------------------------+
+                                          | load bank.txt -> authorize -> apply operation     |
+                                          | -> write bank.txt.tmp -> fsync -> atomic rename   |
+                                          +-------------------------+-------------------------+
+                                                                    |
+                                                         +----------v----------+
+                                                         | pipe-delimited text |
+                                                         | users/accounts/    |
+                                                         | loans/transactions/|
+                                                         | feedback           |
+                                                         +--------------------+
+
+TRANSACTION BOUNDARY
+A single server request loads one consistent state while holding both synchronization locks. A financial operation mutates the in-memory snapshot and commits all affected records together with a temporary-file rewrite and rename. A failed validation does not write the snapshot. The file lock is held during the complete read-modify-write cycle to prevent lost updates from concurrent processes.
