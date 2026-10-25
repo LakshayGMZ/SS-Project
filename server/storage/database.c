@@ -59,10 +59,7 @@ typedef struct {
 struct Database {
     char directory[PATH_MAX];
     int table_fd[DB_TABLE_COUNT];
-    int append_fd[DB_TABLE_COUNT];
     int wal_fd;
-    int commit_fd;
-    int startup_fd;
     bool healthy;
 };
 
@@ -78,9 +75,6 @@ struct DbTransaction {
     DbTable last_append_table;
 };
 
-static const char *table_names[DB_TABLE_COUNT] = {
-    "users", "accounts", "loans", "transactions", "feedback"
-};
 
 static const size_t table_row_sizes[DB_TABLE_COUNT] = {
     USER_ROW_SIZE, ACCOUNT_ROW_SIZE, LOAN_ROW_SIZE,
@@ -95,6 +89,7 @@ static pthread_once_t lock_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t row_mutexes[DB_ROW_SHARDS];
 static pthread_mutex_t append_mutexes[DB_TABLE_COUNT];
 static pthread_mutex_t commit_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t startup_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int validate_database_relations(Database *database);
 
@@ -375,17 +370,11 @@ static int replay_wal(Database *database) {
     return clear_wal(database);
 }
 
-static int acquire_commit_lock(Database *database) {
-    pthread_mutex_lock(&commit_mutex);
-    if (lock_region(database->commit_fd, F_WRLCK, 0, 0) != 0) {
-        pthread_mutex_unlock(&commit_mutex);
-        return -1;
-    }
-    return 0;
+static int acquire_commit_lock(void) {
+    return pthread_mutex_lock(&commit_mutex) == 0 ? 0 : -1;
 }
 
-static void release_commit_lock(Database *database) {
-    lock_region(database->commit_fd, F_UNLCK, 0, 0);
+static void release_commit_lock(void) {
     pthread_mutex_unlock(&commit_mutex);
 }
 
@@ -393,9 +382,9 @@ static int ensure_wal_recovered(Database *database) {
     struct stat status;
     if (fstat(database->wal_fd, &status) != 0) return -1;
     if (status.st_size == 0) return 0;
-    if (acquire_commit_lock(database) != 0) return -1;
+    if (acquire_commit_lock() != 0) return -1;
     int result = replay_wal(database);
-    release_commit_lock(database);
+    release_commit_lock();
     if (result != 0) database->healthy = false;
     return result;
 }
@@ -472,9 +461,9 @@ static int make_directory(const char *path) {
     return -1;
 }
 
-static int open_control_file(const char *directory, const char *name) {
+static int open_wal_file(const char *directory) {
     char path[PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/.locks/%s", directory, name) >= (int)sizeof(path))
+    if (snprintf(path, sizeof(path), "%s/.locks/commit.wal", directory) >= (int)sizeof(path))
         return -1;
     int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd >= 0 && fchmod(fd, 0600) != 0) {
@@ -519,6 +508,7 @@ static int seed_database(Database *database) {
 
 Database *db_open(const char *directory, char *error, size_t error_size) {
     Database *database;
+    bool startup_locked = false;
     char path[PATH_MAX];
     const char *extensions[DB_TABLE_COUNT] = {
         "users.txt", "accounts.txt", "loans.txt", "transactions.txt", "feedback.txt"
@@ -534,7 +524,7 @@ Database *db_open(const char *directory, char *error, size_t error_size) {
     }
     if (snprintf(path, sizeof(path), "%s/.locks", directory) >= (int)sizeof(path) ||
         make_directory(path) != 0) {
-        set_error(error, error_size, "Could not create database lock directory.");
+        set_error(error, error_size, "Could not create database journal directory.");
         return NULL;
     }
 
@@ -543,11 +533,8 @@ Database *db_open(const char *directory, char *error, size_t error_size) {
         set_error(error, error_size, "Not enough memory to open database.");
         return NULL;
     }
-    for (int i = 0; i < DB_TABLE_COUNT; i++) {
-        database->table_fd[i] = -1;
-        database->append_fd[i] = -1;
-    }
-    database->wal_fd = database->commit_fd = database->startup_fd = -1;
+    for (int i = 0; i < DB_TABLE_COUNT; i++) database->table_fd[i] = -1;
+    database->wal_fd = -1;
     snprintf(database->directory, sizeof(database->directory), "%s", directory);
     database->healthy = true;
 
@@ -557,22 +544,14 @@ Database *db_open(const char *directory, char *error, size_t error_size) {
         database->table_fd[i] = open(path, O_RDWR | O_CREAT, 0600);
         if (database->table_fd[i] >= 0 && fchmod(database->table_fd[i], 0600) != 0)
             goto open_failed;
-        char append_name[64];
-        snprintf(append_name, sizeof(append_name), "%s.append.lock", table_names[i]);
-        database->append_fd[i] = open_control_file(directory, append_name);
-        if (database->table_fd[i] < 0 || database->append_fd[i] < 0) goto open_failed;
+        if (database->table_fd[i] < 0) goto open_failed;
     }
-    database->wal_fd = open_control_file(directory, "commit.wal");
-    database->commit_fd = open_control_file(directory, "commit.lock");
-    database->startup_fd = open_control_file(directory, "startup.lock");
-    if (database->wal_fd < 0 || database->commit_fd < 0 || database->startup_fd < 0)
-        goto open_failed;
+    database->wal_fd = open_wal_file(directory);
+    if (database->wal_fd < 0) goto open_failed;
 
-    if (lock_region(database->startup_fd, F_WRLCK, 0, 0) != 0) goto open_failed;
-    if (acquire_commit_lock(database) != 0) {
-        lock_region(database->startup_fd, F_UNLCK, 0, 0);
-        goto open_failed;
-    }
+    if (pthread_mutex_lock(&startup_mutex) != 0) goto open_failed;
+    startup_locked = true;
+    if (acquire_commit_lock() != 0) goto open_failed;
     int recovery_result = replay_wal(database);
     if (recovery_result == 0 && compact_account_rows(database) != 0) recovery_result = -1;
     size_t counts[DB_TABLE_COUNT] = {0};
@@ -593,8 +572,9 @@ Database *db_open(const char *directory, char *error, size_t error_size) {
             if (table_record_count(database, (DbTable)i, &counts[i]) != 0 ||
                 counts[i] > table_limits[i]) count_result = -1;
     }
-    release_commit_lock(database);
-    lock_region(database->startup_fd, F_UNLCK, 0, 0);
+    release_commit_lock();
+    pthread_mutex_unlock(&startup_mutex);
+    startup_locked = false;
     if (recovery_result != 0 || count_result != 0 || seed_result != 0) goto open_failed;
 
     if (validate_database_relations(database) != 0) {
@@ -605,6 +585,7 @@ Database *db_open(const char *directory, char *error, size_t error_size) {
     return database;
 
 open_failed:
+    if (startup_locked) pthread_mutex_unlock(&startup_mutex);
     set_error(error, error_size, "Could not open, initialize, or recover the text database.");
     db_close(database);
     return NULL;
@@ -612,13 +593,9 @@ open_failed:
 
 void db_close(Database *database) {
     if (!database) return;
-    for (int i = 0; i < DB_TABLE_COUNT; i++) {
+    for (int i = 0; i < DB_TABLE_COUNT; i++)
         if (database->table_fd[i] >= 0) close(database->table_fd[i]);
-        if (database->append_fd[i] >= 0) close(database->append_fd[i]);
-    }
     if (database->wal_fd >= 0) close(database->wal_fd);
-    if (database->commit_fd >= 0) close(database->commit_fd);
-    if (database->startup_fd >= 0) close(database->startup_fd);
     free(database);
 }
 
@@ -711,14 +688,9 @@ int db_tx_reserve_append(DbTransaction *transaction, DbTable table) {
         (transaction->has_last_key && table < transaction->last_table)) return -1;
 
     pthread_mutex_lock(&append_mutexes[table]);
-    if (lock_region(transaction->database->append_fd[table], F_WRLCK, 0, 0) != 0) {
-        pthread_mutex_unlock(&append_mutexes[table]);
-        return -1;
-    }
     size_t count;
     if (table_record_count(transaction->database, table, &count) != 0 ||
         count >= table_limits[table]) {
-        lock_region(transaction->database->append_fd[table], F_UNLCK, 0, 0);
         pthread_mutex_unlock(&append_mutexes[table]);
         return -1;
     }
@@ -788,7 +760,6 @@ static void release_transaction_locks(DbTransaction *transaction) {
     }
     for (int i = DB_TABLE_COUNT - 1; i >= 0; i--) {
         if (!transaction->append[i].held) continue;
-        lock_region(database->append_fd[i], F_UNLCK, 0, 0);
         pthread_mutex_unlock(&append_mutexes[i]);
     }
 }
@@ -817,7 +788,7 @@ static int commit_transaction(DbTransaction *transaction) {
             return -1;
     }
     if (count == 0) return 0;
-    if (acquire_commit_lock(database) != 0) return -1;
+    if (acquire_commit_lock() != 0) return -1;
     int result = -1;
     if (replay_wal(database) != 0) goto done;
 
@@ -851,7 +822,7 @@ recover:
     else database->healthy = false;
 
 done:
-    release_commit_lock(database);
+    release_commit_lock();
     return result;
 }
 
