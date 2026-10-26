@@ -69,7 +69,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Database error: %s\n", error);
         return 1;
     }
-    sessions_init();
+    if (!sessions_init(database_directory)) {
+        fprintf(stderr, "Could not initialize shared session storage.\n");
+        db_close(database);
+        return 1;
+    }
     signal(SIGPIPE, SIG_IGN);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);

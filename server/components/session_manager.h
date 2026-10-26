@@ -5,15 +5,7 @@
 #include <stdint.h>
 #include <time.h>
 
-typedef struct {
-    int user_id;
-    int role;
-    time_t last_seen;
-    uintptr_t connection_id;
-    bool active;
-} UserSession;
-
-void sessions_init(void);
+bool sessions_init(const char *database_directory);
 bool sessions_start(int user_id, int role, uintptr_t connection_id);
 bool sessions_authorize(int user_id, int role, uintptr_t connection_id);
 void sessions_logout(int user_id);

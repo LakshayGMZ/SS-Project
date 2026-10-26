@@ -17,6 +17,7 @@ int current_user_id = -1;
 int current_role_id = -1; // 1=Customer, 2=Employee, 3=Manager, 4=Admin
 
 static int client_socket = -1;
+static int server_port = PORT;
 
 static void close_client_connection(void) {
     if (client_socket >= 0) {
@@ -33,7 +34,7 @@ static int connect_client(void) {
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons((unsigned short)server_port);
     if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0 ||
         connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         close_client_connection();
@@ -489,8 +490,21 @@ void administrator_menu() {
 }
 
 
-int main() {
+static int parse_port(const char *text, int *port) {
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+    if (errno || !text[0] || *end || parsed < 1 || parsed > 65535) return -1;
+    *port = (int)parsed;
+    return 0;
+}
+
+int main(int argc, char **argv) {
     int role_choice;
+    if (argc > 2 || (argc == 2 && parse_port(argv[1], &server_port) != 0)) {
+        fprintf(stderr, "Usage: %s [port]\n", argv[0]);
+        return 1;
+    }
     setvbuf(stdout, NULL, _IONBF, 0);
     signal(SIGPIPE, SIG_IGN);
     atexit(close_client_connection);
