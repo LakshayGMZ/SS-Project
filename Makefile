@@ -1,5 +1,4 @@
 CC = cc
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic
 SERVER_SOURCES = server/app/main.c \
 	server/components/request_handler.c \
 	server/components/session_manager.c \
@@ -14,12 +13,12 @@ SERVER_HEADERS = server/components/request_handler.h \
 all: bank-server client
 
 bank-server: $(SERVER_SOURCES) $(SERVER_HEADERS)
-	$(CC) $(CFLAGS) -pthread -Iserver/components -Iserver/storage -Iserver/utils $(SERVER_SOURCES) -o bank-server
+	$(CC) -pthread -Iserver/components -Iserver/storage -Iserver/utils $(SERVER_SOURCES) -o bank-server
 
 server: bank-server
 
 client: client.c
-	$(CC) $(CFLAGS) client.c -o client
+	$(CC) client.c -o client
 
 clean:
 	rm -f bank-server client

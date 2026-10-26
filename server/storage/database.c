@@ -463,7 +463,7 @@ static int make_directory(const char *path) {
 
 static int open_wal_file(const char *directory) {
     char path[PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/.locks/commit.wal", directory) >= (int)sizeof(path))
+    if (snprintf(path, sizeof(path), "%s/commit.wal", directory) >= (int)sizeof(path))
         return -1;
     int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd >= 0 && fchmod(fd, 0600) != 0) {
@@ -520,11 +520,6 @@ Database *db_open(const char *directory, char *error, size_t error_size) {
     }
     if (make_directory(directory) != 0) {
         set_error(error, error_size, "Could not create database directory.");
-        return NULL;
-    }
-    if (snprintf(path, sizeof(path), "%s/.locks", directory) >= (int)sizeof(path) ||
-        make_directory(path) != 0) {
-        set_error(error, error_size, "Could not create database journal directory.");
         return NULL;
     }
 
